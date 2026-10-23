@@ -120,8 +120,12 @@ class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=STATIC, **kwargs)
 
-    def log_message(self, fmt, *args):  # keep the console clean
-        if "/api/" in (args[0] if args else ""):
+    def log_message(self, fmt, *args):  # keep the console clean — API calls only
+        try:
+            msg = fmt % args if args else str(fmt)
+        except Exception:
+            msg = str(fmt)
+        if "/api/" in msg:
             super().log_message(fmt, *args)
 
     def send_json(self, code: int, obj: dict):
@@ -133,6 +137,11 @@ class Handler(SimpleHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self):
+        if self.path == "/favicon.ico":
+            self.send_response(204)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         if self.path == "/api/health":
             return self.send_json(200, {
                 "ok": True,
