@@ -72,7 +72,7 @@
   <div class="tag">Real-time webcam object detection · Jev AI identification</div>
   <div class="badges">
     <span class="badge" id="badgeCam">● Camera off</span>
-    <span class="badge" id="badgeModel">● Detector loading…</span>
+    <span class="badge" id="badgeModel">● YOLO: checking…</span>
     <span class="badge off" id="badgeJev">● Jev: checking…</span>
   </div>
 </header>
@@ -83,8 +83,8 @@
       <video id="video" autoplay playsinline muted></video>
       <canvas id="overlay"></canvas>
       <div class="placeholder" id="placeholder">
-        <div class="spinner" id="phSpinner"></div>
-        <div id="phText">Loading the detector model…<br><small>(first load downloads ~13 MB — give it a few seconds)</small></div>
+        <div class="spinner" id="phSpinner" style="display:none"></div>
+        <div id="phText">Click <b>Start Camera</b> and allow webcam access.<br><small>Detection runs on YOLOv8 (server-side) — boxes update live as fast as your CPU allows.</small></div>
       </div>
     </div>
 
@@ -128,22 +128,22 @@
     <div class="card">
       <h2><i>◆</i> How it works</h2>
       <p class="hint">
-        Bounding boxes run <b>locally in your browser</b> (COCO-SSD) at full frame rate — <b>no video ever leaves your machine</b>.
-        Every few seconds only the detection <i>state</i> (object names + confidences) goes to the backend, which asks
-        <b>Jev</b> — TypeSafe AI's decision model — typed probability questions about it: is the person really there,
-        is a detection likely false, did the detector miss something, is this worth flagging?
-        Jev needs <code>JEV_API_KEY</code> set on the server; without it, detection still works fully and this panel mirrors local labels.
+        The webcam preview is a smooth local video. Frames are sent to the Python backend, which runs
+        <b>YOLOv8</b> (Ultralytics) on each frame and returns bounding boxes that are drawn over the video —
+        on CPU expect roughly 5–12 detections/sec.
+        Every few seconds the detection <i>state</i> (object names + confidences) also goes to
+        <b>Jev</b> — TypeSafe AI's decision model — which answers typed probability questions about it: is the person really there,
+        is a detection likely false, did YOLO miss something, is this worth flagging?
+        Jev needs <code>JEV_API_KEY</code> set on the server; without it, YOLO detection still works fully.
       </p>
     </div>
   </aside>
 </main>
 
-<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.17.0/dist/tf.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
 <script>
 const $ = id => document.getElementById(id);
 const video = $("video"), canvas = $("overlay"), ctx = canvas.getContext("2d");
-let model = null, stream = null, running = false;
+let stream = null, running = false, yoloWarned = false;
 let current = [];               // latest detections [{class, score, bbox}]
 let prevClasses = new Set();    // classes present in previous frame (for the log)
 let totalDetections = 0, jevCalls = 0, jevBusy = false, lastJevAt = 0;
@@ -160,29 +160,17 @@ function logEvent(kind, text){
   while (log.children.length > 30) log.lastChild.remove();
 }
 
-/* ---------- backend health: is Jev configured? ---------- */
+/* ---------- backend health: Jev + YOLO status ---------- */
 let jevConfigured = false;
 fetch("/api/health").then(r => r.json()).then(h => {
   jevConfigured = !!h.jev_configured;
   badge($("badgeJev"), jevConfigured ? "● Jev: ON (decision layer)" : "● Jev: not configured", jevConfigured ? "ai" : "off");
-  if (!jevConfigured) $("jevMeta").textContent = "Server has no JEV_API_KEY — Jev layer is off, local detection unaffected.";
-}).catch(() => badge($("badgeJev"), "● Jev: server unreachable", "off"));
-
-/* ---------- load COCO-SSD ---------- */
-cocoSsd.load({base: "mobilenet_v2"}).then(m => {
-  model = m;
-  badge($("badgeModel"), "● Detector ready", "on");
-  $("phText").innerHTML = "Detector ready.<br>Click <b>Start Camera</b> and allow webcam access.";
-  $("phSpinner").style.display = "none";
-}).catch(e => {
-  badge($("badgeModel"), "● Detector failed to load", "off");
-  $("phText").textContent = "Could not load the detector model (check your internet for the CDN). " + e.message;
-  $("phSpinner").style.display = "none";
-});
+  if (!jevConfigured) $("jevMeta").textContent = "Server has no JEV_API_KEY — Jev layer is off, YOLO detection unaffected.";
+  badge($("badgeModel"), h.yolo_available ? `● YOLO: ready (${h.yolo_model})` : "● YOLO: NOT INSTALLED on server", h.yolo_available ? "on" : "off");
+}).catch(() => { badge($("badgeJev"), "● Jev: server unreachable", "off"); badge($("badgeModel"), "● YOLO: server unreachable", "off"); });
 
 /* ---------- camera ---------- */
 $("btnStart").onclick = async () => {
-  if (!model) return;
   try {
     stream = await navigator.mediaDevices.getUserMedia({video: {width: {ideal: 1280}, height: {ideal: 720}}, audio: false});
   } catch (e) {
@@ -196,7 +184,7 @@ $("btnStart").onclick = async () => {
   running = true;
   badge($("badgeCam"), "● Camera live", "on");
   $("btnStart").disabled = true; $("btnStop").disabled = false; $("btnSnap").disabled = false;
-  requestAnimationFrame(loop);
+  detectLoop();
   logEvent("in", "Camera started");
 };
 $("btnStop").onclick = () => {
@@ -210,16 +198,44 @@ $("btnStop").onclick = () => {
   logEvent("out", "Camera stopped");
 };
 
-/* ---------- detection loop ---------- */
-async function loop(){
-  if (!running) return;
-  if (video.readyState === 4) {
-    current = await model.detect(video);
+/* ---------- YOLO detection loop (server-side) ---------- */
+const snapCanvas = document.createElement("canvas");
+async function detectLoop(){
+  while (running) {
+    const t0 = performance.now();
+    await detectOnce();
+    const dt = performance.now() - t0;
+    if (dt < 120) await new Promise(r => setTimeout(r, 120 - dt));  // cap ~8 req/sec
+  }
+}
+async function detectOnce(){
+  if (video.readyState !== 4) return;
+  const w = 640, h = Math.round(video.videoHeight * (640 / video.videoWidth));
+  snapCanvas.width = w; snapCanvas.height = h;
+  snapCanvas.getContext("2d").drawImage(video, 0, 0, w, h);
+  const image = snapCanvas.toDataURL("image/jpeg", 0.75);
+  let data;
+  try {
+    const res = await fetch("/api/detect", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({image})
+    });
+    data = await res.json();
+  } catch (e) { return; }  // transient network hiccup — next loop retries
+  if (data.status === "ok") {
+    const sx = canvas.width / data.image_width, sy = canvas.height / data.image_height;
+    current = data.detections.map(d => ({
+      class: d.class, score: d.score,
+      bbox: [d.bbox[0] * sx, d.bbox[1] * sy, d.bbox[2] * sx, d.bbox[3] * sy]
+    }));
     draw(current);
     updateStats(current);
     maybeAskJev();
+  } else if (!yoloWarned) {
+    yoloWarned = true;
+    logEvent("out", "YOLO unavailable — " + (data.error || data.status));
+    badge($("badgeModel"), "● YOLO: error (see log)", "off");
   }
-  requestAnimationFrame(loop);
 }
 function draw(dets){
   ctx.clearRect(0, 0, canvas.width, canvas.height);

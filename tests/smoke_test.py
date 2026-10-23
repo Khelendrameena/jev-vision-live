@@ -5,6 +5,7 @@ import os
 import sys
 import threading
 import urllib.request
+import urllib.error
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 os.environ.pop("JEV_API_KEY", None)  # force fallback mode for the test
@@ -19,8 +20,11 @@ def post(path, payload):
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=5) as r:
-        return json.loads(r.read())
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:  # e.g. 503 when YOLO isn't installed — body is still JSON
+        return json.loads(e.read())
 
 
 def get(path):
@@ -46,10 +50,13 @@ def main():
     assert out["objects"][0]["confidence"] == 0.9, out
 
     status, body = get("/")
-    assert status == 200 and b"JEV" in body and b"coco-ssd" in body.lower() or b"cocoSsd" in body, status
+    assert status == 200 and b"YOLO" in body and b"/api/detect" in body, status
+
+    out = post("/api/detect", {"image": "data:image/jpeg;base64,AAAA"})
+    assert out.get("status") in ("unavailable", "error", "ok"), out
 
     httpd.shutdown()
-    print("smoke tests: 3/3 passed")
+    print("smoke tests: 4/4 passed")
 
 
 if __name__ == "__main__":

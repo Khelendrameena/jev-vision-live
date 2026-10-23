@@ -5,14 +5,14 @@ JevVision Live — real-time webcam object detection + Jev AI decision layer.
 Architecture
 ------------
 Browser (static/index.html)
-  - getUserMedia webcam stream
-  - TensorFlow.js COCO-SSD runs IN the browser -> bounding boxes at full frame rate.
-    No video ever leaves the machine for detection.
-  - Every `interval` seconds it POSTs the current detection *state*
-    (objects, confidences, counts) to /api/identify.
+  - getUserMedia webcam stream (display only — smooth 60 fps preview)
+  - Frames are grabbed (~10x/sec) and POSTed to /api/detect; returned boxes
+    are drawn on the overlay canvas.
 
-Backend (this file, Python standard library only — no pip installs needed)
+Backend (this file, Python standard library + ultralytics for YOLO)
   - Serves the page and static assets.
+  - POST /api/detect -> runs YOLOv8 (ultralytics) on the frame and returns
+    bounding boxes. First call downloads the yolov8n weights (~6 MB).
   - POST /api/identify -> asks Jev (TypeSafe AI's decision model) typed
     probability questions about the detection state, e.g. "how likely is a
     person actually present?", "how likely is one of these detections a
@@ -33,12 +33,58 @@ Configuration (environment variables)
 Run:  python app.py   ->  open http://localhost:8000
 """
 
+import base64
+import io
 import json
 import os
+import threading
 import time
 import urllib.request
 import urllib.error
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
+
+# --- YOLO (optional at import time so the server still boots without it) ---
+try:
+    from ultralytics import YOLO
+    _YOLO_IMPORT_ERROR = None
+except Exception as e:  # pragma: no cover
+    YOLO = None
+    _YOLO_IMPORT_ERROR = f"{type(e).__name__}: {e}"
+
+YOLO_MODEL_NAME = os.environ.get("YOLO_MODEL", "yolov8n.pt")
+YOLO_CONF = float(os.environ.get("YOLO_CONF", "0.35"))
+_detector = None
+_detector_lock = threading.Lock()
+
+
+def get_detector():
+    """Lazy-load YOLO once (first call also downloads the weights)."""
+    global _detector
+    if YOLO is None:
+        return None
+    if _detector is None:
+        with _detector_lock:
+            if _detector is None:
+                _detector = YOLO(YOLO_MODEL_NAME)
+    return _detector
+
+
+def run_yolo(image_bytes: bytes) -> dict:
+    """Run YOLO on one JPEG frame; return detections in pixel coords."""
+    from PIL import Image
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    model = get_detector()
+    results = model.predict(img, conf=YOLO_CONF, imgsz=640, verbose=False)[0]
+    detections = []
+    names = results.names
+    for box in results.boxes:
+        x1, y1, x2, y2 = (float(v) for v in box.xyxy[0].tolist())
+        detections.append({
+            "class": names[int(box.cls[0])],
+            "score": round(float(box.conf[0]), 3),
+            "bbox": [round(x1, 1), round(y1, 1), round(x2 - x1, 1), round(y2 - y1, 1)],
+        })
+    return {"detections": detections, "image_width": img.width, "image_height": img.height}
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 STATIC = os.path.join(ROOT, "static")
@@ -81,7 +127,7 @@ def build_state(detections: list, stats: dict) -> dict:
     """The 'state' Jev reasons over — detector output, not pixels."""
     classes = [d.get("class", "object") for d in detections]
     return {
-        "detector": "coco-ssd-mobilenet-v2 (in-browser)",
+        "detector": "yolov8 (ultralytics, server-side)",
         "objects": [
             {"class": d.get("class", "object"),
              "confidence": round(float(d.get("score", 0)), 3)}
@@ -147,12 +193,46 @@ class Handler(SimpleHTTPRequestHandler):
                 "ok": True,
                 "jev_configured": bool(JEV_API_KEY),
                 "jev_mode": "decide (typed probability questions)" if JEV_API_KEY else None,
+                "yolo_available": YOLO is not None,
+                "yolo_model": YOLO_MODEL_NAME if YOLO is not None else None,
+                "yolo_error": _YOLO_IMPORT_ERROR,
             })
         if self.path in ("/", ""):
             self.path = "/index.html"
         return super().do_GET()
 
+    def handle_detect(self):
+        if YOLO is None:
+            return self.send_json(503, {
+                "status": "unavailable",
+                "error": f"YOLO is not installed on the server ({_YOLO_IMPORT_ERROR}). Run: pip install -r requirements.txt",
+            })
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length > 6_000_000:
+                return self.send_json(413, {"error": "frame too large"})
+            req = json.loads(self.rfile.read(length) or b"{}")
+            data_uri = req.get("image", "")
+            image_bytes = base64.b64decode(data_uri.split(",", 1)[-1])
+        except Exception:
+            return self.send_json(400, {"error": "bad frame payload"})
+        started = time.time()
+        try:
+            out = run_yolo(image_bytes)
+        except Exception as e:
+            return self.send_json(200, {"status": "error", "error": f"YOLO failed: {type(e).__name__}: {e}"})
+        return self.send_json(200, {
+            "status": "ok",
+            "model": YOLO_MODEL_NAME,
+            "detections": out["detections"],
+            "image_width": out["image_width"],
+            "image_height": out["image_height"],
+            "latency_ms": int((time.time() - started) * 1000),
+        })
+
     def do_POST(self):
+        if self.path == "/api/detect":
+            return self.handle_detect()
         if self.path != "/api/identify":
             return self.send_json(404, {"error": "not found"})
         try:
@@ -210,7 +290,8 @@ class Handler(SimpleHTTPRequestHandler):
 def main():
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     print(f"JevVision Live -> http://localhost:{PORT}")
-    print(f"Jev decision layer: {'ON (' + JEV_API_URL + ')' if JEV_API_KEY else 'OFF — set JEV_API_KEY to enable (local detection still works)'}")
+    print(f"YOLO detection: {'ON (model: ' + YOLO_MODEL_NAME + ', loads on first frame)' if YOLO is not None else 'OFF — run: pip install -r requirements.txt'}")
+    print(f"Jev decision layer: {'ON (' + JEV_API_URL + ')' if JEV_API_KEY else 'OFF — set JEV_API_KEY to enable'}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
