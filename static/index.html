@@ -57,6 +57,12 @@
   #log li .out{color:var(--red); font-weight:700}
   .hint{font-size:12.5px; color:var(--muted); line-height:1.55}
   .hint code{background:var(--panel2); padding:1px 6px; border-radius:5px; color:var(--amber)}
+  .bar-row{margin-top:10px}
+  .bar-row .bar-head{display:flex; justify-content:space-between; font-size:13px; color:var(--light); margin-bottom:4px}
+  .bar-row .bar-head b{color:var(--amber)}
+  .bar-track{height:9px; background:var(--panel2); border:1px solid var(--bord); border-radius:99px; overflow:hidden}
+  .bar-fill{height:100%; background:var(--green); border-radius:99px; transition:width .5s ease}
+  .bar-fill.warn{background:var(--amber)} .bar-fill.bad{background:var(--red)}
 </style>
 </head>
 <body>
@@ -84,7 +90,7 @@
     <div class="controls">
       <button id="btnStart">▶ Start Camera</button>
       <button id="btnStop" class="secondary" disabled>■ Stop</button>
-      <label class="ctl"><input type="checkbox" id="chkJev" checked> Ask Jev to identify</label>
+      <label class="ctl"><input type="checkbox" id="chkJev" checked> Jev decision layer</label>
       <label class="ctl">Jev interval
         <select id="selInterval">
           <option value="1500">1.5 s</option>
@@ -93,7 +99,7 @@
           <option value="6000">6 s</option>
         </select>
       </label>
-      <button id="btnSnap" class="secondary" disabled>📸 Ask Jev Now</button>
+      <button id="btnSnap" class="secondary" disabled>⚡ Ask Jev Now</button>
     </div>
 
     <div class="stats">
@@ -106,8 +112,9 @@
 
   <aside>
     <div class="card">
-      <h2><i>◆</i> Jev Identification</h2>
-      <div id="jevScene"><span class="dim">Jev will describe the scene here once the camera starts.</span></div>
+      <h2><i>◆</i> Jev Decision Layer</h2>
+      <div id="jevScene"><span class="dim">Jev will judge the detector's output here once the camera starts — is that person really there? Did the detector miss something?</span></div>
+      <div id="jevBars"></div>
       <div class="chips" id="jevChips"></div>
       <div id="jevMeta"></div>
     </div>
@@ -120,9 +127,11 @@
     <div class="card">
       <h2><i>◆</i> How it works</h2>
       <p class="hint">
-        Bounding boxes run <b>locally in your browser</b> (COCO-SSD) at full frame rate — nothing is uploaded for detection.
-        Every few seconds one frame is sent to the backend, which asks <b>Jev</b> to verify and identify what's really in it.
-        Jev needs <code>JEV_API_KEY</code> set on the server; without it, the panel shows local labels and detection still works fully.
+        Bounding boxes run <b>locally in your browser</b> (COCO-SSD) at full frame rate — <b>no video ever leaves your machine</b>.
+        Every few seconds only the detection <i>state</i> (object names + confidences) goes to the backend, which asks
+        <b>Jev</b> — TypeSafe AI's decision model — typed probability questions about it: is the person really there,
+        is a detection likely false, did the detector miss something, is this worth flagging?
+        Jev needs <code>JEV_API_KEY</code> set on the server; without it, detection still works fully and this panel mirrors local labels.
       </p>
     </div>
   </aside>
@@ -137,7 +146,7 @@ let model = null, stream = null, running = false;
 let current = [];               // latest detections [{class, score, bbox}]
 let prevClasses = new Set();    // classes present in previous frame (for the log)
 let totalDetections = 0, jevCalls = 0, jevBusy = false, lastJevAt = 0;
-let frames = 0, fpsT = performance.now();
+let frames = 0, fpsT = performance.now(), lastFps = 0;
 
 /* ---------- status helpers ---------- */
 function badge(el, text, cls){ el.textContent = text; el.className = "badge " + (cls || ""); }
@@ -154,8 +163,8 @@ function logEvent(kind, text){
 let jevConfigured = false;
 fetch("/api/health").then(r => r.json()).then(h => {
   jevConfigured = !!h.jev_configured;
-  badge($("badgeJev"), jevConfigured ? `● Jev: ON (${h.jev_model})` : "● Jev: not configured", jevConfigured ? "ai" : "off");
-  if (!jevConfigured) $("jevMeta").textContent = "Server has no JEV_API_KEY — Jev panel mirrors local detection.";
+  badge($("badgeJev"), jevConfigured ? "● Jev: ON (decision layer)" : "● Jev: not configured", jevConfigured ? "ai" : "off");
+  if (!jevConfigured) $("jevMeta").textContent = "Server has no JEV_API_KEY — Jev layer is off, local detection unaffected.";
 }).catch(() => badge($("badgeJev"), "● Jev: server unreachable", "off"));
 
 /* ---------- load COCO-SSD ---------- */
@@ -227,7 +236,7 @@ function draw(dets){
 function updateStats(dets){
   frames++;
   const now = performance.now();
-  if (now - fpsT >= 1000) { $("stFps").textContent = frames; frames = 0; fpsT = now; }
+  if (now - fpsT >= 1000) { lastFps = frames; $("stFps").textContent = frames; frames = 0; fpsT = now; }
   $("stNow").textContent = dets.length;
   totalDetections += dets.length;
   $("stSeen").textContent = totalDetections;
@@ -249,15 +258,10 @@ $("btnSnap").onclick = () => askJev();
 async function askJev(){
   if (jevBusy || !running) return;
   jevBusy = true; lastJevAt = performance.now();
-  const snap = document.createElement("canvas");
-  const scale = 640 / video.videoWidth;
-  snap.width = 640; snap.height = Math.round(video.videoHeight * scale);
-  snap.getContext("2d").drawImage(video, 0, 0, snap.width, snap.height);
-  const image = snap.toDataURL("image/jpeg", 0.8);
   try {
     const res = await fetch("/api/identify", {
       method: "POST", headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({image, detections: current.slice(0, 10)})
+      body: JSON.stringify({detections: current.slice(0, 10), stats: {fps: lastFps}})
     });
     const data = await res.json();
     jevCalls++; $("stJev").textContent = jevCalls;
@@ -268,23 +272,35 @@ async function askJev(){
   jevBusy = false;
 }
 function showJev(data){
-  const scene = $("jevScene"), chips = $("jevChips"), meta = $("jevMeta");
-  chips.innerHTML = "";
+  const scene = $("jevScene"), bars = $("jevBars"), chips = $("jevChips"), meta = $("jevMeta");
+  chips.innerHTML = ""; bars.innerHTML = "";
+  // Local detector objects always shown as chips.
+  for (const o of data.objects || []) {
+    const c = document.createElement("span"); c.className = "chip";
+    c.innerHTML = `${o.name} <b>${Math.round((o.confidence || 0) * 100)}%</b>`;
+    chips.appendChild(c);
+  }
   if (data.status === "ok") {
-    scene.textContent = data.scene || "Jev returned no scene description.";
-    for (const o of data.objects || []) {
-      const c = document.createElement("span"); c.className = "chip";
-      c.innerHTML = `${o.name} <b>${Math.round((o.confidence || 0) * 100)}%</b>${o.note ? " · " + o.note : ""}`;
-      chips.appendChild(c);
+    const byId = {};
+    for (const a of data.answers || []) {
+      byId[a.id] = a.probability;
+      const pct = Math.round(a.probability * 100);
+      const cls = a.id === "person_present" || a.id === "alert_worthy"
+        ? (pct >= 60 ? "" : pct >= 35 ? "warn" : "")
+        : (pct >= 60 ? "bad" : pct >= 35 ? "warn" : "");
+      const row = document.createElement("div"); row.className = "bar-row";
+      row.innerHTML = `<div class="bar-head"><span>${a.label}</span><b>${pct}%</b></div>
+        <div class="bar-track"><div class="bar-fill ${cls}" style="width:${pct}%"></div></div>`;
+      bars.appendChild(row);
     }
-    meta.textContent = `Jev identified ${ (data.objects || []).length } object(s) · ${data.latency_ms} ms round trip`;
+    const person = Math.round((byId.person_present || 0) * 100);
+    const fp = Math.round((byId.false_positive || 0) * 100);
+    scene.textContent = person >= 60
+      ? `Jev verdict: a person is very likely in frame (${person}%), false-positive risk ${fp}%.`
+      : `Jev verdict: person presence uncertain (${person}%), false-positive risk ${fp}%.`;
+    meta.textContent = `Jev judged the detection state in ${data.latency_ms} ms · call #${jevCalls}`;
   } else if (data.status === "not_configured") {
-    scene.innerHTML = `<span class="dim">Jev is not configured on the server — showing local detector labels. Set JEV_API_KEY to switch on real Jev identification.</span>`;
-    for (const o of data.objects || []) {
-      const c = document.createElement("span"); c.className = "chip";
-      c.innerHTML = `${o.name} <b>${Math.round((o.confidence || 0) * 100)}%</b>`;
-      chips.appendChild(c);
-    }
+    scene.innerHTML = `<span class="dim">Jev is not configured on the server — chips below are raw local detector labels. Set JEV_API_KEY to switch on Jev's judgement.</span>`;
     meta.textContent = "";
   } else {
     scene.innerHTML = `<span class="dim">Jev error — local detection continues.</span>`;

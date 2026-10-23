@@ -38,8 +38,8 @@ def main():
     assert status == 200 and health["ok"] and health["jev_configured"] is False, health
 
     out = post("/api/identify", {
-        "image": "data:image/jpeg;base64,/9j/4AAQSkZJRg==",
         "detections": [{"class": "person", "score": 0.9}, {"class": "dog", "score": 0.7}],
+        "stats": {"fps": 24},
     })
     assert out["status"] == "not_configured", out
     assert [o["name"] for o in out["objects"]] == ["person", "dog"], out
