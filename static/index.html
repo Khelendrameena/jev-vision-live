@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>JevVision Live — Real-Time Object Detection + Jev AI</title>
+<style>
+  :root{
+    --bg:#0b1526; --panel:#14263d; --panel2:#101e33; --bord:#27476e;
+    --red:#e1251b; --amber:#f5b841; --green:#4cc38a; --txt:#eaf1f9;
+    --light:#d7e0ec; --muted:#9fb2c8;
+  }
+  *{box-sizing:border-box; margin:0; padding:0}
+  body{background:var(--bg); color:var(--txt); font-family:"Segoe UI",Calibri,Arial,sans-serif; min-height:100vh}
+  header{display:flex; align-items:center; gap:14px; padding:14px 22px; border-bottom:3px solid var(--red); flex-wrap:wrap}
+  header h1{font-size:22px; letter-spacing:.4px}
+  header h1 span{color:var(--red)}
+  header .tag{color:var(--muted); font-size:13px}
+  .badges{margin-left:auto; display:flex; gap:8px; flex-wrap:wrap}
+  .badge{font-size:12px; font-weight:600; padding:5px 11px; border-radius:999px; border:1px solid var(--bord); background:var(--panel2); color:var(--muted)}
+  .badge.on{color:#0b1526; background:var(--green); border-color:var(--green)}
+  .badge.ai{color:#0b1526; background:var(--amber); border-color:var(--amber)}
+  .badge.off{color:var(--light)}
+  main{display:grid; grid-template-columns:1fr 360px; gap:16px; padding:16px 22px; max-width:1560px; margin:0 auto}
+  @media (max-width:980px){ main{grid-template-columns:1fr} }
+  .stage{background:#000; border:1px solid var(--bord); border-radius:12px; overflow:hidden; position:relative; min-height:300px}
+  .stage video{width:100%; display:block}
+  .stage canvas{position:absolute; inset:0; width:100%; height:100%}
+  .stage .placeholder{position:absolute; inset:0; display:flex; flex-direction:column; gap:10px; align-items:center; justify-content:center; color:var(--muted); text-align:center; padding:20px}
+  .spinner{width:38px; height:38px; border-radius:50%; border:4px solid var(--bord); border-top-color:var(--red); animation:spin 0.9s linear infinite}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .controls{display:flex; gap:10px; flex-wrap:wrap; margin-top:14px; align-items:center}
+  button{background:var(--red); color:#fff; border:none; font-weight:700; font-size:14px; padding:10px 18px; border-radius:8px; cursor:pointer}
+  button.secondary{background:var(--panel); border:1px solid var(--bord); color:var(--light)}
+  button:disabled{opacity:.45; cursor:not-allowed}
+  label.ctl{font-size:13px; color:var(--muted); display:flex; align-items:center; gap:7px}
+  select{background:var(--panel); color:var(--light); border:1px solid var(--bord); border-radius:6px; padding:7px 9px; font-size:13px}
+  input[type=checkbox]{width:16px; height:16px; accent-color:var(--red)}
+  .stats{display:flex; gap:10px; margin-top:14px; flex-wrap:wrap}
+  .stat{flex:1; min-width:100px; background:var(--panel); border:1px solid var(--bord); border-radius:10px; padding:10px 12px}
+  .stat b{display:block; font-size:20px; color:var(--amber)}
+  .stat span{font-size:11.5px; color:var(--muted); text-transform:uppercase; letter-spacing:.5px}
+  aside{display:flex; flex-direction:column; gap:16px}
+  .card{background:var(--panel); border:1px solid var(--bord); border-radius:12px; padding:15px 16px}
+  .card h2{font-size:13px; text-transform:uppercase; letter-spacing:1px; color:var(--muted); margin-bottom:10px}
+  .card h2 i{color:var(--red); font-style:normal}
+  #jevScene{font-size:15.5px; line-height:1.45; color:var(--txt)}
+  #jevScene .dim{color:var(--muted); font-size:14px}
+  .chips{display:flex; flex-wrap:wrap; gap:7px; margin-top:11px}
+  .chip{background:var(--panel2); border:1px solid var(--bord); border-radius:999px; padding:5px 11px; font-size:12.5px; color:var(--light)}
+  .chip b{color:var(--amber)}
+  #jevMeta{margin-top:10px; font-size:12px; color:var(--muted)}
+  #log{list-style:none; max-height:290px; overflow-y:auto; font-size:13px}
+  #log li{padding:6px 2px; border-bottom:1px solid var(--panel2); color:var(--light)}
+  #log li time{color:var(--muted); font-size:11.5px; margin-right:7px}
+  #log li .in{color:var(--green); font-weight:700}
+  #log li .out{color:var(--red); font-weight:700}
+  .hint{font-size:12.5px; color:var(--muted); line-height:1.55}
+  .hint code{background:var(--panel2); padding:1px 6px; border-radius:5px; color:var(--amber)}
+</style>
+</head>
+<body>
+<header>
+  <h1>JEV<span>VISION</span> LIVE</h1>
+  <div class="tag">Real-time webcam object detection · Jev AI identification</div>
+  <div class="badges">
+    <span class="badge" id="badgeCam">● Camera off</span>
+    <span class="badge" id="badgeModel">● Detector loading…</span>
+    <span class="badge off" id="badgeJev">● Jev: checking…</span>
+  </div>
+</header>
+
+<main>
+  <section>
+    <div class="stage">
+      <video id="video" autoplay playsinline muted></video>
+      <canvas id="overlay"></canvas>
+      <div class="placeholder" id="placeholder">
+        <div class="spinner" id="phSpinner"></div>
+        <div id="phText">Loading the detector model…<br><small>(first load downloads ~13 MB — give it a few seconds)</small></div>
+      </div>
+    </div>
+
+    <div class="controls">
+      <button id="btnStart">▶ Start Camera</button>
+      <button id="btnStop" class="secondary" disabled>■ Stop</button>
+      <label class="ctl"><input type="checkbox" id="chkJev" checked> Ask Jev to identify</label>
+      <label class="ctl">Jev interval
+        <select id="selInterval">
+          <option value="1500">1.5 s</option>
+          <option value="2500" selected>2.5 s</option>
+          <option value="4000">4 s</option>
+          <option value="6000">6 s</option>
+        </select>
+      </label>
+      <button id="btnSnap" class="secondary" disabled>📸 Ask Jev Now</button>
+    </div>
+
+    <div class="stats">
+      <div class="stat"><b id="stFps">—</b><span>Detector FPS</span></div>
+      <div class="stat"><b id="stNow">0</b><span>Objects in frame</span></div>
+      <div class="stat"><b id="stSeen">0</b><span>Detections (total)</span></div>
+      <div class="stat"><b id="stJev">0</b><span>Jev calls</span></div>
+    </div>
+  </section>
+
+  <aside>
+    <div class="card">
+      <h2><i>◆</i> Jev Identification</h2>
+      <div id="jevScene"><span class="dim">Jev will describe the scene here once the camera starts.</span></div>
+      <div class="chips" id="jevChips"></div>
+      <div id="jevMeta"></div>
+    </div>
+
+    <div class="card">
+      <h2><i>◆</i> Live Event Log</h2>
+      <ul id="log"></ul>
+    </div>
+
+    <div class="card">
+      <h2><i>◆</i> How it works</h2>
+      <p class="hint">
+        Bounding boxes run <b>locally in your browser</b> (COCO-SSD) at full frame rate — nothing is uploaded for detection.
+        Every few seconds one frame is sent to the backend, which asks <b>Jev</b> to verify and identify what's really in it.
+        Jev needs <code>JEV_API_KEY</code> set on the server; without it, the panel shows local labels and detection still works fully.
+      </p>
+    </div>
+  </aside>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.17.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+const video = $("video"), canvas = $("overlay"), ctx = canvas.getContext("2d");
+let model = null, stream = null, running = false;
+let current = [];               // latest detections [{class, score, bbox}]
+let prevClasses = new Set();    // classes present in previous frame (for the log)
+let totalDetections = 0, jevCalls = 0, jevBusy = false, lastJevAt = 0;
+let frames = 0, fpsT = performance.now();
+
+/* ---------- status helpers ---------- */
+function badge(el, text, cls){ el.textContent = text; el.className = "badge " + (cls || ""); }
+function logEvent(kind, text){
+  const li = document.createElement("li");
+  const t = new Date().toLocaleTimeString("en-IN", {hour12:false});
+  li.innerHTML = `<time>${t}</time><span class="${kind}">${kind === "in" ? "＋" : "－"}</span> ${text}`;
+  const log = $("log");
+  log.prepend(li);
+  while (log.children.length > 30) log.lastChild.remove();
+}
+
+/* ---------- backend health: is Jev configured? ---------- */
+let jevConfigured = false;
+fetch("/api/health").then(r => r.json()).then(h => {
+  jevConfigured = !!h.jev_configured;
+  badge($("badgeJev"), jevConfigured ? `● Jev: ON (${h.jev_model})` : "● Jev: not configured", jevConfigured ? "ai" : "off");
+  if (!jevConfigured) $("jevMeta").textContent = "Server has no JEV_API_KEY — Jev panel mirrors local detection.";
+}).catch(() => badge($("badgeJev"), "● Jev: server unreachable", "off"));
+
+/* ---------- load COCO-SSD ---------- */
+cocoSsd.load({base: "mobilenet_v2"}).then(m => {
+  model = m;
+  badge($("badgeModel"), "● Detector ready", "on");
+  $("phText").innerHTML = "Detector ready.<br>Click <b>Start Camera</b> and allow webcam access.";
+  $("phSpinner").style.display = "none";
+}).catch(e => {
+  badge($("badgeModel"), "● Detector failed to load", "off");
+  $("phText").textContent = "Could not load the detector model (check your internet for the CDN). " + e.message;
+  $("phSpinner").style.display = "none";
+});
+
+/* ---------- camera ---------- */
+$("btnStart").onclick = async () => {
+  if (!model) return;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({video: {width: {ideal: 1280}, height: {ideal: 720}}, audio: false});
+  } catch (e) {
+    $("phText").textContent = "Camera access denied: " + e.message;
+    return;
+  }
+  video.srcObject = stream;
+  await video.play();
+  canvas.width = video.videoWidth; canvas.height = video.videoHeight;
+  $("placeholder").style.display = "none";
+  running = true;
+  badge($("badgeCam"), "● Camera live", "on");
+  $("btnStart").disabled = true; $("btnStop").disabled = false; $("btnSnap").disabled = false;
+  requestAnimationFrame(loop);
+  logEvent("in", "Camera started");
+};
+$("btnStop").onclick = () => {
+  running = false;
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  badge($("badgeCam"), "● Camera off", "");
+  $("btnStart").disabled = false; $("btnStop").disabled = true; $("btnSnap").disabled = true;
+  $("placeholder").style.display = "flex";
+  $("phText").textContent = "Camera stopped. Click Start Camera to resume.";
+  logEvent("out", "Camera stopped");
+};
+
+/* ---------- detection loop ---------- */
+async function loop(){
+  if (!running) return;
+  if (video.readyState === 4) {
+    current = await model.detect(video);
+    draw(current);
+    updateStats(current);
+    maybeAskJev();
+  }
+  requestAnimationFrame(loop);
+}
+function draw(dets){
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.lineWidth = Math.max(2, canvas.width / 400);
+  ctx.font = `600 ${Math.max(14, canvas.width / 55)}px Segoe UI, sans-serif`;
+  for (const d of dets) {
+    const [x, y, w, h] = d.bbox;
+    ctx.strokeStyle = "#e1251b"; ctx.strokeRect(x, y, w, h);
+    const label = `${d.class} ${Math.round(d.score * 100)}%`;
+    const tw = ctx.measureText(label).width + 12;
+    ctx.fillStyle = "#e1251b"; ctx.fillRect(x, y - 24, tw, 24);
+    ctx.fillStyle = "#fff"; ctx.fillText(label, x + 6, y - 6);
+  }
+}
+function updateStats(dets){
+  frames++;
+  const now = performance.now();
+  if (now - fpsT >= 1000) { $("stFps").textContent = frames; frames = 0; fpsT = now; }
+  $("stNow").textContent = dets.length;
+  totalDetections += dets.length;
+  $("stSeen").textContent = totalDetections;
+  const nowClasses = new Set(dets.map(d => d.class));
+  for (const c of nowClasses) if (!prevClasses.has(c)) logEvent("in", `<b>${c}</b> entered the frame`);
+  for (const c of prevClasses) if (!nowClasses.has(c)) logEvent("out", `<b>${c}</b> left the frame`);
+  prevClasses = nowClasses;
+}
+
+/* ---------- Jev identification ---------- */
+function maybeAskJev(){
+  if (!$("chkJev").checked || jevBusy) return;
+  const interval = parseInt($("selInterval").value, 10);
+  if (performance.now() - lastJevAt < interval) return;
+  askJev();
+}
+$("btnSnap").onclick = () => askJev();
+
+async function askJev(){
+  if (jevBusy || !running) return;
+  jevBusy = true; lastJevAt = performance.now();
+  const snap = document.createElement("canvas");
+  const scale = 640 / video.videoWidth;
+  snap.width = 640; snap.height = Math.round(video.videoHeight * scale);
+  snap.getContext("2d").drawImage(video, 0, 0, snap.width, snap.height);
+  const image = snap.toDataURL("image/jpeg", 0.8);
+  try {
+    const res = await fetch("/api/identify", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({image, detections: current.slice(0, 10)})
+    });
+    const data = await res.json();
+    jevCalls++; $("stJev").textContent = jevCalls;
+    showJev(data);
+  } catch (e) {
+    $("jevMeta").textContent = "Jev request failed: " + e.message;
+  }
+  jevBusy = false;
+}
+function showJev(data){
+  const scene = $("jevScene"), chips = $("jevChips"), meta = $("jevMeta");
+  chips.innerHTML = "";
+  if (data.status === "ok") {
+    scene.textContent = data.scene || "Jev returned no scene description.";
+    for (const o of data.objects || []) {
+      const c = document.createElement("span"); c.className = "chip";
+      c.innerHTML = `${o.name} <b>${Math.round((o.confidence || 0) * 100)}%</b>${o.note ? " · " + o.note : ""}`;
+      chips.appendChild(c);
+    }
+    meta.textContent = `Jev identified ${ (data.objects || []).length } object(s) · ${data.latency_ms} ms round trip`;
+  } else if (data.status === "not_configured") {
+    scene.innerHTML = `<span class="dim">Jev is not configured on the server — showing local detector labels. Set JEV_API_KEY to switch on real Jev identification.</span>`;
+    for (const o of data.objects || []) {
+      const c = document.createElement("span"); c.className = "chip";
+      c.innerHTML = `${o.name} <b>${Math.round((o.confidence || 0) * 100)}%</b>`;
+      chips.appendChild(c);
+    }
+    meta.textContent = "";
+  } else {
+    scene.innerHTML = `<span class="dim">Jev error — local detection continues.</span>`;
+    meta.textContent = data.error || "Unknown Jev error";
+  }
+}
+</script>
+</body>
+</html>
